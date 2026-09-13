@@ -1,117 +1,625 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import jwt from 'jsonwebtoken';
-import Razorpay from 'razorpay';
-import { WebSocketServer } from 'ws';
-import http from 'http';
-import { Pool } from 'pg';
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const jwt = require("jsonwebtoken");
+const { WebSocketServer } = require("ws");
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET";
 
 app.use(cors());
 app.use(express.json());
 
-const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
+/*
+  =========================================
+  PRO LIVE VOICE CHAT BACKEND
+  =========================================
 
-const razorpay = process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
-  ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
-  : null;
+  Features:
+  - Health check
+  - User register/login demo API
+  - JWT authentication
+  - Voice room create/join/leave
+  - WebSocket realtime room signaling
+  - Realtime chat
+  - Online user list
+*/
 
-const json = (res, data, status = 200) => res.status(status).json(data);
+const users = new Map();
+const rooms = new Map();
+const sockets = new Map();
 
-app.get('/health', (_, res) => json(res, { ok: true, service: 'pro-live-voice-api' }));
+/* -----------------------------
+   BASIC ROUTES
+------------------------------ */
 
-app.get('/api/config', (_, res) => json(res, {
-  agencyCode: '7077',
-  voiceProvider: 'livekit',
-  paymentProvider: 'razorpay',
-  maxSeats: 12
-}));
-
-app.post('/api/auth/request-otp', (req, res) => {
-  const { phone } = req.body || {};
-  if (!phone) return json(res, { error: 'phone_required' }, 400);
-  // Replace with a real SMS provider before production.
-  return json(res, { ok: true, message: 'OTP provider integration required' });
-});
-
-app.post('/api/auth/verify-otp', (req, res) => {
-  const { phone } = req.body || {};
-  if (!phone) return json(res, { error: 'phone_required' }, 400);
-  const token = jwt.sign({ phone, dev: true }, process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME', { expiresIn: '1h' });
-  return json(res, { ok: true, token, warning: 'Development authentication only' });
-});
-
-app.get('/api/rooms', async (_, res) => {
-  if (!pool) return json(res, { rooms: [] });
-  const r = await pool.query('select id, title, host_id, max_seats, locked, created_at from rooms order by created_at desc limit 50');
-  return json(res, { rooms: r.rows });
-});
-
-app.post('/api/rooms', async (req, res) => {
-  const { title, hostId, maxSeats = 12 } = req.body || {};
-  if (!title || !hostId) return json(res, { error: 'title_and_host_required' }, 400);
-  if (!pool) return json(res, { ok: true, id: 'DEV_ROOM', title, hostId, maxSeats, warning: 'DB not configured' });
-  const r = await pool.query(
-    'insert into rooms(title, host_id, max_seats) values($1,$2,$3) returning *',
-    [title, hostId, Math.min(Number(maxSeats) || 12, 12)]
-  );
-  return json(res, { room: r.rows[0] }, 201);
-});
-
-app.post('/api/rooms/:id/join', (req, res) => {
-  const { userId } = req.body || {};
-  return json(res, { ok: true, roomId: req.params.id, userId, note: 'Join LiveKit after obtaining a short-lived token.' });
-});
-
-app.post('/api/livekit/token', (req, res) => {
-  if (!process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET) {
-    return json(res, { error: 'livekit_not_configured' }, 501);
-  }
-  // Install livekit-server-sdk and implement token generation here.
-  return json(res, { error: 'livekit_server_sdk_hook_required' }, 501);
-});
-
-app.post('/api/payments/order', async (req, res) => {
-  if (!razorpay) return json(res, { error: 'razorpay_not_configured' }, 501);
-  const { amountPaise, receipt } = req.body || {};
-  if (!amountPaise) return json(res, { error: 'amount_required' }, 400);
-  const order = await razorpay.orders.create({
-    amount: Number(amountPaise),
-    currency: 'INR',
-    receipt: receipt || `plv_${Date.now()}`,
-    payment_capture: 1
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    app: "Pro Live Voice Chat",
+    status: "online",
+    message: "Backend server is running"
   });
-  return json(res, { orderId: order.id, amount: order.amount, currency: order.currency });
 });
 
-app.post('/api/payments/verify', (req, res) => {
-  // IMPORTANT: implement Razorpay signature verification on the server
-  // before crediting diamonds.
-  return json(res, { error: 'server_side_signature_verification_required' }, 501);
+app.get("/health", (req, res) => {
+  res.json({
+    success: true,
+    status: "healthy",
+    time: new Date().toISOString()
+  });
 });
 
-app.post('/api/wallet/withdraw', (req, res) => {
-  return json(res, { error: 'KYC_and_payout_provider_required' }, 501);
+/* -----------------------------
+   REGISTER
+------------------------------ */
+
+app.post("/api/auth/register", (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({
+      success: false,
+      message: "Username and password are required"
+    });
+  }
+
+  if (users.has(username)) {
+    return res.status(409).json({
+      success: false,
+      message: "User already exists"
+    });
+  }
+
+  const user = {
+    id: "U" + Date.now(),
+    username,
+    diamonds: 0,
+    beans: 0,
+    createdAt: new Date().toISOString()
+  };
+
+  users.set(username, {
+    ...user,
+    password
+  });
+
+  const token = jwt.sign(
+    {
+      id: user.id,
+      username: user.username
+    },
+    JWT_SECRET,
+    {
+      expiresIn: "7d"
+    }
+  );
+
+  res.json({
+    success: true,
+    user,
+    token
+  });
 });
 
-const clients = new Set();
-wss.on('connection', ws => {
-  clients.add(ws);
-  ws.send(JSON.stringify({ type: 'connected', service: 'pro-live-voice' }));
-  ws.on('message', raw => {
-    let event;
-    try { event = JSON.parse(raw.toString()); } catch { return; }
-    for (const client of clients) {
-      if (client.readyState === 1) client.send(JSON.stringify(event));
+/* -----------------------------
+   LOGIN
+------------------------------ */
+
+app.post("/api/auth/login", (req, res) => {
+  const { username, password } = req.body;
+
+  const user = users.get(username);
+
+  if (!user || user.password !== password) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid username or password"
+    });
+  }
+
+  const token = jwt.sign(
+    {
+      id: user.id,
+      username: user.username
+    },
+    JWT_SECRET,
+    {
+      expiresIn: "7d"
+    }
+  );
+
+  res.json({
+    success: true,
+    token,
+    user: {
+      id: user.id,
+      username: user.username,
+      diamonds: user.diamonds,
+      beans: user.beans
     }
   });
-  ws.on('close', () => clients.delete(ws));
 });
 
-server.listen(Number(process.env.PORT || 8080), () => {
-  console.log(`PRO LIVE VOICE API listening on ${process.env.PORT || 8080}`);
+/* -----------------------------
+   AUTH MIDDLEWARE
+------------------------------ */
+
+function auth(req, res, next) {
+  const header = req.headers.authorization;
+
+  if (!header || !header.startsWith("Bearer ")) {
+    return res.status(401).json({
+      success: false,
+      message: "Authorization token required"
+    });
+  }
+
+  const token = header.substring(7);
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired token"
+    });
+  }
+}
+
+/* -----------------------------
+   CREATE ROOM
+------------------------------ */
+
+app.post("/api/rooms", auth, (req, res) => {
+  const {
+    name = "Live Voice Room",
+    maxSeats = 12
+  } = req.body;
+
+  const roomId =
+    "ROOM-" +
+    Date.now().toString(36).toUpperCase();
+
+  const room = {
+    id: roomId,
+    name,
+    ownerId: req.user.id,
+    ownerUsername: req.user.username,
+    maxSeats: Math.min(Number(maxSeats) || 12, 12),
+    users: [],
+    createdAt: new Date().toISOString()
+  };
+
+  rooms.set(roomId, room);
+
+  res.json({
+    success: true,
+    room
+  });
+});
+
+/* -----------------------------
+   ROOM LIST
+------------------------------ */
+
+app.get("/api/rooms", (req, res) => {
+  const list = Array.from(rooms.values()).map(room => ({
+    id: room.id,
+    name: room.name,
+    ownerUsername: room.ownerUsername,
+    users: room.users.length,
+    maxSeats: room.maxSeats,
+    createdAt: room.createdAt
+  }));
+
+  res.json({
+    success: true,
+    rooms: list
+  });
+});
+
+/* -----------------------------
+   ROOM DETAILS
+------------------------------ */
+
+app.get("/api/rooms/:roomId", (req, res) => {
+  const room = rooms.get(req.params.roomId);
+
+  if (!room) {
+    return res.status(404).json({
+      success: false,
+      message: "Room not found"
+    });
+  }
+
+  res.json({
+    success: true,
+    room
+  });
+});
+
+/* -----------------------------
+   DELETE ROOM
+------------------------------ */
+
+app.delete("/api/rooms/:roomId", auth, (req, res) => {
+  const room = rooms.get(req.params.roomId);
+
+  if (!room) {
+    return res.status(404).json({
+      success: false,
+      message: "Room not found"
+    });
+  }
+
+  if (room.ownerId !== req.user.id) {
+    return res.status(403).json({
+      success: false,
+      message: "Only room owner can delete this room"
+    });
+  }
+
+  rooms.delete(req.params.roomId);
+
+  broadcast(req.params.roomId, {
+    type: "ROOM_CLOSED",
+    roomId: req.params.roomId
+  });
+
+  res.json({
+    success: true,
+    message: "Room deleted"
+  });
+});
+
+/* -----------------------------
+   WEBSOCKET SERVER
+------------------------------ */
+
+const wss = new WebSocketServer({
+  server
+});
+
+function send(ws, data) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(data));
+  }
+}
+
+function broadcast(roomId, data, exceptWs = null) {
+  const room = rooms.get(roomId);
+
+  if (!room) return;
+
+  for (const user of room.users) {
+    const ws = sockets.get(user.id);
+
+    if (ws && ws !== exceptWs) {
+      send(ws, data);
+    }
+  }
+}
+
+function roomUsers(roomId) {
+  const room = rooms.get(roomId);
+
+  if (!room) return [];
+
+  return room.users.map(user => ({
+    id: user.id,
+    username: user.username,
+    seat: user.seat,
+    muted: user.muted
+  }));
+}
+
+wss.on("connection", (ws, req) => {
+  console.log("WebSocket connected");
+
+  let currentUser = null;
+  let currentRoom = null;
+
+  send(ws, {
+    type: "CONNECTED",
+    message: "Connected to Pro Live Voice Chat"
+  });
+
+  ws.on("message", message => {
+    try {
+      const data = JSON.parse(message.toString());
+
+      /* -------------------------
+         AUTHENTICATE
+      -------------------------- */
+
+      if (data.type === "AUTH") {
+        try {
+          const decoded = jwt.verify(
+            data.token,
+            JWT_SECRET
+          );
+
+          currentUser = decoded;
+
+          sockets.set(currentUser.id, ws);
+
+          send(ws, {
+            type: "AUTH_SUCCESS",
+            user: currentUser
+          });
+        } catch (error) {
+          send(ws, {
+            type: "ERROR",
+            message: "Invalid authentication token"
+          });
+        }
+
+        return;
+      }
+
+      if (!currentUser) {
+        send(ws, {
+          type: "ERROR",
+          message: "Authenticate first"
+        });
+
+        return;
+      }
+
+      /* -------------------------
+         JOIN ROOM
+      -------------------------- */
+
+      if (data.type === "JOIN_ROOM") {
+        const room = rooms.get(data.roomId);
+
+        if (!room) {
+          send(ws, {
+            type: "ERROR",
+            message: "Room not found"
+          });
+
+          return;
+        }
+
+        if (
+          room.users.length >= room.maxSeats
+        ) {
+          send(ws, {
+            type: "ERROR",
+            message: "Room is full"
+          });
+
+          return;
+        }
+
+        if (
+          room.users.some(
+            user => user.id === currentUser.id
+          )
+        ) {
+          send(ws, {
+            type: "ERROR",
+            message: "Already joined"
+          });
+
+          return;
+        }
+
+        const usedSeats = new Set(
+          room.users.map(user => user.seat)
+        );
+
+        let seat = 1;
+
+        while (usedSeats.has(seat)) {
+          seat++;
+        }
+
+        const roomUser = {
+          id: currentUser.id,
+          username: currentUser.username,
+          seat,
+          muted: false
+        };
+
+        room.users.push(roomUser);
+
+        currentRoom = room.id;
+
+        send(ws, {
+          type: "ROOM_JOINED",
+          room,
+          users: roomUsers(room.id)
+        });
+
+        broadcast(
+          room.id,
+          {
+            type: "USER_JOINED",
+            user: roomUser,
+            users: roomUsers(room.id)
+          },
+          ws
+        );
+
+        return;
+      }
+
+      /* -------------------------
+         LEAVE ROOM
+      -------------------------- */
+
+      if (data.type === "LEAVE_ROOM") {
+        leaveRoom();
+
+        return;
+      }
+
+      /* -------------------------
+         CHAT MESSAGE
+      -------------------------- */
+
+      if (data.type === "CHAT") {
+        if (!currentRoom) return;
+
+        const chat = {
+          type: "CHAT",
+          userId: currentUser.id,
+          username: currentUser.username,
+          message: String(data.message || "").substring(0, 500),
+          time: new Date().toISOString()
+        };
+
+        broadcast(currentRoom, chat);
+
+        send(ws, chat);
+
+        return;
+      }
+
+      /* -------------------------
+         MIC ON/OFF
+      -------------------------- */
+
+      if (data.type === "MIC_STATE") {
+        if (!currentRoom) return;
+
+        const room = rooms.get(currentRoom);
+
+        if (!room) return;
+
+        const user = room.users.find(
+          u => u.id === currentUser.id
+        );
+
+        if (!user) return;
+
+        user.muted = Boolean(data.muted);
+
+        broadcast(currentRoom, {
+          type: "MIC_STATE",
+          userId: currentUser.id,
+          muted: user.muted
+        });
+
+        return;
+      }
+
+      /* -------------------------
+         WEBRTC SIGNALING
+      -------------------------- */
+
+      if (data.type === "OFFER") {
+        forwardSignal(data, currentUser);
+        return;
+      }
+
+      if (data.type === "ANSWER") {
+        forwardSignal(data, currentUser);
+        return;
+      }
+
+      if (data.type === "ICE_CANDIDATE") {
+        forwardSignal(data, currentUser);
+        return;
+      }
+
+      /* -------------------------
+         PING
+      -------------------------- */
+
+      if (data.type === "PING") {
+        send(ws, {
+          type: "PONG",
+          time: Date.now()
+        });
+      }
+    } catch (error) {
+      console.error("WebSocket error:", error);
+
+      send(ws, {
+        type: "ERROR",
+        message: "Invalid message"
+      });
+    }
+  });
+
+  function forwardSignal(data, sender) {
+    const targetId = data.targetUserId;
+
+    if (!targetId) return;
+
+    const targetWs = sockets.get(targetId);
+
+    if (!targetWs) {
+      send(ws, {
+        type: "ERROR",
+        message: "Target user is offline"
+      });
+
+      return;
+    }
+
+    send(targetWs, {
+      ...data,
+      fromUserId: sender.id,
+      fromUsername: sender.username
+    });
+  }
+
+  function leaveRoom() {
+    if (!currentRoom || !currentUser) return;
+
+    const room = rooms.get(currentRoom);
+
+    if (!room) {
+      currentRoom = null;
+      return;
+    }
+
+    room.users = room.users.filter(
+      user => user.id !== currentUser.id
+    );
+
+    broadcast(currentRoom, {
+      type: "USER_LEFT",
+      userId: currentUser.id,
+      username: currentUser.username,
+      users: roomUsers(currentRoom)
+    });
+
+    currentRoom = null;
+  }
+
+  ws.on("close", () => {
+    leaveRoom();
+
+    if (currentUser) {
+      sockets.delete(currentUser.id);
+    }
+
+    console.log("WebSocket disconnected");
+  });
+
+  ws.on("error", error => {
+    console.error("WebSocket error:", error);
+  });
+});
+
+/* -----------------------------
+   START SERVER
+------------------------------ */
+
+server.listen(PORT, () => {
+  console.log(
+    `Pro Live Voice Chat server running on port ${PORT}`
+  );
 });
